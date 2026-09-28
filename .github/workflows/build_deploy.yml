@@ -1,0 +1,104 @@
+name: campus-portal CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  DJANGO_SETTINGS_MODULE: campus_portal.settings
+  PYTHONUNBUFFERED: "1"
+  DJANGO_SECRET_KEY: ${{ secrets.DJANGO_SECRET_KEY }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  EB_APPLICATION_NAME: ${{ secrets.EB_APPLICATION_NAME }}
+  EB_ENVIRONMENT_NAME: ${{ secrets.EB_ENVIRONMENT_NAME }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with: 
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install coverage
+      
+      - name: SonarQube Cloud Scan
+        uses: SonarSource/sonarqube-scan-action@v7
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+  deploy:
+      name: Build, Push to ECR and Deploy to EB
+      needs: quality
+      runs-on: ubuntu-latest
+
+      steps:
+        - name: Checkout
+          uses: actions/checkout@v4
+
+        - name: Configure AWS credentials
+          uses: aws-actions/configure-aws-credentials@v4
+          with:
+            aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+            aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+            aws-region: ${{ secrets.AWS_REGION }}
+
+        - name: Login to Amazon ECR
+          id: login-ecr
+          uses: aws-actions/amazon-ecr-login@v2
+
+        - name: Build Docker image
+          run: |
+            docker build -t $ECR_REPOSITORY:$IMAGE_TAG .
+            docker tag $ECR_REPOSITORY:$IMAGE_TAG ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$IMAGE_TAG
+
+        - name: Push Docker image to ECR
+          run: |
+            docker push ${{ steps.login-ecr.outputs.registry }}/$ECR_REPOSITORY:$IMAGE_TAG
+
+        - name: Generate Dockerrun.aws.json
+          run: |
+            cat > Dockerrun.aws.json <<EOF
+            {
+              "AWSEBDockerrunVersion": "1",
+              "Image": {
+                "Name": "${{ steps.login-ecr.outputs.registry }}/${ECR_REPOSITORY}:${IMAGE_TAG}",
+                "Update": "true"
+              },
+              "Ports": [
+                {
+                  "ContainerPort": "8080"
+                }
+              ]
+            }
+            EOF
+
+        - name: Create deployment bundle
+          run: |
+            zip -r deploy.zip Dockerrun.aws.json .platform
+
+        - name: Deploy to Elastic Beanstalk
+          uses: aws-actions/aws-elasticbeanstalk-deploy@v1.0.0
+          with:
+            aws-region: ${{ secrets.AWS_REGION }}
+            application-name: ${{ secrets.EB_APPLICATION_NAME }}
+            environment-name: ${{ secrets.EB_ENVIRONMENT_NAME }}
+            version-label: django-${{ github.run_number }}-${{ github.sha }}
+            deployment-package-path: deploy.zip
+      
